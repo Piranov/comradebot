@@ -16,10 +16,25 @@ import irc.connection
 load_dotenv()
 
 DATABASE = "comradebot.db"
-NETWORK = os.getenv("IRC_NETWORK", "RIZON").strip() or "RIZON"
-NICK = os.getenv("NICK", "ComradeBot")
-PASSWORD = os.getenv("RIZON_PASS")
-CHANNEL = os.getenv("RIZON_CHANNEL", "#animekindergarten")
+IRC_NETWORK = os.getenv("IRC_NETWORK", "").strip()
+IRC_SERVER = os.getenv("IRC_SERVER", "").strip()
+IRC_PORT = int(os.getenv("IRC_PORT", "6697"))
+IRC_TLS_VALUE = os.getenv("IRC_TLS", "true").strip().casefold()
+IRC_CHANNEL = os.getenv("IRC_CHANNEL", "").strip()
+IRC_NICK = os.getenv("IRC_NICK", "ComradeBot")
+IRC_PASSWORD = os.getenv("IRC_PASSWORD")
+
+if IRC_TLS_VALUE in {"true", "1", "yes", "on"}:
+    IRC_TLS = True
+elif IRC_TLS_VALUE in {"false", "0", "no", "off"}:
+    IRC_TLS = False
+else:
+    raise RuntimeError("IRC_TLS must be true or false")
+
+if not IRC_NETWORK or not IRC_SERVER or not IRC_CHANNEL:
+    raise RuntimeError(
+        "IRC_NETWORK, IRC_SERVER, and IRC_CHANNEL must be configured"
+    )
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "dolphin-mistral:latest")
@@ -77,7 +92,7 @@ def initialize_database():
             )
             connection.execute(
                 "UPDATE channel_messages SET network = ?",
-                (NETWORK,),
+                (IRC_NETWORK,),
             )
 
 
@@ -253,11 +268,11 @@ def extract_prompt(message):
     """
 
     # ^\s* anchors at the start while allowing leading whitespace.
-    # re.escape(NICK) matches the configured nickname literally.
+    # re.escape(IRC_NICK) matches the configured nickname literally.
     # The nickname must be followed by ":"/"," or whitespace, preventing
     # partial-word matches such as "SuperComradeBot" and "ComradeBotFan".
     # (.+?) captures the prompt, and \s*$ ignores trailing whitespace.
-    pattern = rf"^\s*{re.escape(NICK)}(?:\s*[:,]\s*|\s+)(.+?)\s*$"
+    pattern = rf"^\s*{re.escape(IRC_NICK)}(?:\s*[:,]\s*|\s+)(.+?)\s*$"
 
     match = re.match(pattern, message, re.IGNORECASE)
 
@@ -381,31 +396,50 @@ def format_calculator_result(result):
 class ComradeBot(irc.bot.SingleServerIRCBot):
 
     def __init__(self):
-        context = ssl.create_default_context()
+        if IRC_TLS:
+            context = ssl.create_default_context()
 
-        wrapper = functools.partial(
-            context.wrap_socket,
-            server_hostname="irc.rizon.net",
-        )
+            wrapper = functools.partial(
+                context.wrap_socket,
+                server_hostname=IRC_SERVER,
+            )
 
-        factory = irc.connection.Factory(wrapper=wrapper)
+            factory = irc.connection.Factory(wrapper=wrapper)
+        else:
+            factory = irc.connection.Factory()
 
         super().__init__(
-            [("irc.rizon.net", 6697)],
-            NICK,
-            NICK,
+            [(IRC_SERVER, IRC_PORT)],
+            IRC_NICK,
+            IRC_NICK,
             connect_factory=factory,
         )
 
+    def _connect(self):
+        print(f"Attempting to connect to {IRC_SERVER}:{IRC_PORT}.")
+        super()._connect()
+
     def on_welcome(self, connection, event):
-        print("Connected to Rizon.")
+        print(f"Connected to {IRC_NETWORK} ({IRC_SERVER}:{IRC_PORT}).")
 
-        if PASSWORD:
+        if IRC_PASSWORD:
             print("Identifying with NickServ.")
-            connection.privmsg("NickServ", f"IDENTIFY {PASSWORD}")
+            connection.privmsg("NickServ", f"IDENTIFY {IRC_PASSWORD}")
 
-        print(f"Joining {CHANNEL}.")
-        connection.join(CHANNEL)
+        print(f"Joining {IRC_CHANNEL}.")
+        connection.join(IRC_CHANNEL)
+
+    def on_join(self, connection, event):
+        if event.source.nick == connection.get_nickname():
+            print(f"Joined {event.target} on {IRC_NETWORK}.")
+
+    def on_disconnect(self, connection, event):
+        reason = event.arguments[0] if event.arguments else "unknown reason"
+        print(f"Connection error or disconnect: {reason or 'connection failed'}")
+
+    def on_error(self, connection, event):
+        reason = " ".join(event.arguments) if event.arguments else "unknown error"
+        print(f"IRC connection error: {reason}")
 
     def on_pubmsg(self, connection, event):
         nick = event.source.nick
@@ -449,8 +483,8 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
         # Outgoing replies are stored when sent. Ignore any server echo of
         # those replies so each bot message appears in memory only once.
-        if nick.casefold() != NICK.casefold():
-            store_message(NETWORK, channel, nick, message)
+        if nick.casefold() != IRC_NICK.casefold():
+            store_message(IRC_NETWORK, channel, nick, message)
 
         prompt = extract_prompt(message)
 
@@ -464,7 +498,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         if datetime_request:
             reply_message = f"{nick}: {format_datetime_reply(datetime_request)}"
             connection.privmsg(channel, reply_message)
-            store_message(NETWORK, channel, NICK, reply_message)
+            store_message(IRC_NETWORK, channel, IRC_NICK, reply_message)
             return
 
         calculator_expression = extract_calculator_expression(prompt)
@@ -479,12 +513,12 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                 reply_message = f"{nick}: invalid or unsafe calculation"
 
             connection.privmsg(channel, reply_message)
-            store_message(NETWORK, channel, NICK, reply_message)
+            store_message(IRC_NETWORK, channel, IRC_NICK, reply_message)
             return
 
         def worker():
             try:
-                reply = ask_llm(prompt, NETWORK, channel)
+                reply = ask_llm(prompt, IRC_NETWORK, channel)
                 reply_lines = [
                     f"{nick}: {line}"
                     for line in split_message(reply)
@@ -494,9 +528,9 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                     channel,
                     reply_lines,
                     on_send=lambda line: store_message(
-                        NETWORK,
+                        IRC_NETWORK,
                         channel,
-                        NICK,
+                        IRC_NICK,
                         line,
                     ),
                 )
@@ -505,7 +539,12 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                 print(f"ERROR: {e}")
                 error_message = f"{nick}: error talking to Ollama"
                 connection.privmsg(channel, error_message)
-                store_message(NETWORK, channel, NICK, error_message)
+                store_message(
+                    IRC_NETWORK,
+                    channel,
+                    IRC_NICK,
+                    error_message,
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -513,9 +552,16 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 if __name__ == "__main__":
     initialize_database()
 
-    print(f"Starting {NICK}")
-    print(f"Channel: {CHANNEL}")
+    print(f"Starting {IRC_NICK}")
+    print(f"Network: {IRC_NETWORK}")
+    print(f"Server: {IRC_SERVER}:{IRC_PORT}")
+    print(f"TLS: {'enabled' if IRC_TLS else 'disabled'}")
+    print(f"Channel: {IRC_CHANNEL}")
     print(f"Model: {OLLAMA_MODEL}")
 
-    bot = ComradeBot()
-    bot.start()
+    try:
+        bot = ComradeBot()
+        bot.start()
+    except Exception as e:
+        print(f"Connection error or exception: {e}")
+        raise

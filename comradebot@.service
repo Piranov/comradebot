@@ -1,0 +1,16 @@
+[Unit]
+Description=ComradeBot IRC instance (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/animekindergarten-bot
+EnvironmentFile=%h/animekindergarten-bot/%i.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/animekindergarten-bot/.venv/bin/python %h/animekindergarten-bot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
