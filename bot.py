@@ -1,0 +1,521 @@
+from dotenv import load_dotenv
+from datetime import datetime
+import ast
+import os
+import ssl
+import functools
+import threading
+import textwrap
+import time
+import re
+import sqlite3
+import requests
+import irc.bot
+import irc.connection
+
+load_dotenv()
+
+DATABASE = "comradebot.db"
+NETWORK = os.getenv("IRC_NETWORK", "RIZON").strip() or "RIZON"
+NICK = os.getenv("NICK", "ComradeBot")
+PASSWORD = os.getenv("RIZON_PASS")
+CHANNEL = os.getenv("RIZON_CHANNEL", "#animekindergarten")
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "dolphin-mistral:latest")
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_URL = "https://api.tavily.com/search"
+
+CALCULATOR_OPERATORS = {
+    ast.Add: lambda left, right: left + right,
+    ast.Sub: lambda left, right: left - right,
+    ast.Mult: lambda left, right: left * right,
+    ast.Div: lambda left, right: left / right,
+    ast.Mod: lambda left, right: left % right,
+    ast.Pow: lambda left, right: left ** right,
+}
+
+SYSTEM_PROMPT = """
+You are ComradeBot, a local LLM IRC bot.
+
+You are chatting in a casual anime/nerd IRC channel.
+Keep replies short, funny, and conversational.
+Avoid markdown.
+Avoid huge walls of text.
+Do not pretend to know things you do not know.
+""".strip()
+
+
+def initialize_database():
+    with sqlite3.connect(DATABASE) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                network TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                nick TEXT NOT NULL,
+                message TEXT NOT NULL
+            )
+            """
+        )
+
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(channel_messages)"
+            )
+        }
+
+        # Existing databases predate network separation. Add the column and
+        # assign their existing history to the configured IRC network.
+        if "network" not in columns:
+            connection.execute(
+                "ALTER TABLE channel_messages ADD COLUMN network TEXT"
+            )
+            connection.execute(
+                "UPDATE channel_messages SET network = ?",
+                (NETWORK,),
+            )
+
+
+def store_message(network, channel, nick, message):
+    with sqlite3.connect(DATABASE) as connection:
+        connection.execute(
+            """
+            INSERT INTO channel_messages (network, channel, nick, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (network, channel, nick, message),
+        )
+        connection.execute(
+            """
+            DELETE FROM channel_messages
+            WHERE network = ?
+              AND channel = ?
+              AND id NOT IN (
+                SELECT id
+                FROM channel_messages
+                WHERE network = ?
+                  AND channel = ?
+                ORDER BY id DESC
+                LIMIT 500
+            )
+            """,
+            (network, channel, network, channel),
+        )
+
+
+def get_channel_context(network, channel, limit=30):
+    with sqlite3.connect(DATABASE) as connection:
+        rows = connection.execute(
+            """
+            SELECT timestamp, nick, message
+            FROM channel_messages
+            WHERE network = ?
+              AND channel = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (network, channel, limit),
+        ).fetchall()
+
+    rows.reverse()
+    return "\n".join(
+        f"[{timestamp}] {nick}: {message}"
+        for timestamp, nick, message in rows
+    )
+
+
+def ask_llm(prompt, network, channel):
+    context = get_channel_context(network, channel)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if context:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Recent IRC channel messages:\n{context}",
+            }
+        )
+
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "messages": messages,
+    }
+
+    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    response.raise_for_status()
+
+    data = response.json()
+    return data["message"]["content"].strip()
+
+
+def search_tavily(query):
+    if not TAVILY_API_KEY:
+        raise RuntimeError("TAVILY_API_KEY is not configured")
+
+    response = requests.post(
+        TAVILY_URL,
+        headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+        json={
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 3,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    return response.json().get("results", [])[:3]
+
+
+def compact_numbered_lists(text):
+    paragraphs = []
+    numbered_items = []
+
+    def flush_numbered_items():
+        if numbered_items:
+            paragraphs.append(" | ".join(numbered_items))
+            numbered_items.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        if re.match(r"^\d+[.)]\s+\S", stripped):
+            numbered_items.append(stripped)
+            continue
+
+        flush_numbered_items()
+
+        if stripped:
+            paragraphs.append(stripped)
+
+    flush_numbered_items()
+    return paragraphs
+
+
+def split_message(text, max_len=350, max_lines=3):
+    output = []
+
+    for paragraph in compact_numbered_lists(text):
+        wrapped = textwrap.wrap(
+            paragraph,
+            width=max_len,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+
+        if wrapped:
+            output.extend(wrapped)
+
+    if not output:
+        return ["..."]
+
+    if len(output) > max_lines:
+        output = output[:max_lines]
+        output[-1] = f"{output[-1][:max_len - 3].rstrip()}..."
+
+    return output
+
+
+def send_lines(connection, channel, lines, on_send=None):
+    for index, line in enumerate(lines):
+        connection.privmsg(channel, line)
+
+        if on_send:
+            on_send(line)
+
+        if index < len(lines) - 1:
+            time.sleep(1)
+
+
+def extract_search_query(message):
+    match = re.match(r"^\s*!search(?:\s+(.*?))?\s*$", message, re.IGNORECASE)
+
+    if not match:
+        return None
+
+    return (match.group(1) or "").strip()
+
+
+def extract_prompt(message):
+    """
+    Matches:
+    ComradeBot: hello
+    comradebot, hello
+    COMRADEBOT hello
+    """
+
+    # ^\s* anchors at the start while allowing leading whitespace.
+    # re.escape(NICK) matches the configured nickname literally.
+    # The nickname must be followed by ":"/"," or whitespace, preventing
+    # partial-word matches such as "SuperComradeBot" and "ComradeBotFan".
+    # (.+?) captures the prompt, and \s*$ ignores trailing whitespace.
+    pattern = rf"^\s*{re.escape(NICK)}(?:\s*[:,]\s*|\s+)(.+?)\s*$"
+
+    match = re.match(pattern, message, re.IGNORECASE)
+
+    if not match:
+        return None
+
+    return match.group(1).strip()
+
+
+def get_datetime_request(prompt):
+    # Ignore capitalization and trailing question punctuation when matching
+    # common ways users ask for the current local time or date.
+    normalized = prompt.casefold().strip().rstrip("?.!")
+
+    time_phrases = {
+        "what time is it",
+        "what's the time",
+        "whats the time",
+        "current time",
+    }
+    date_phrases = {
+        "what date is it",
+        "what day is it",
+        "current date",
+    }
+
+    if normalized in time_phrases:
+        return "time"
+
+    if normalized in date_phrases:
+        return "date"
+
+    return None
+
+
+def format_datetime_reply(request_type):
+    # astimezone() uses the local system timezone configured on the bot host.
+    now = datetime.now().astimezone()
+
+    if request_type == "time":
+        return f"The current time is {now:%H:%M:%S %Z}."
+
+    return f"Today is {now:%A, %B %d, %Y}."
+
+
+def extract_calculator_expression(prompt):
+    normalized = prompt.strip().rstrip("?.!")
+    explicit = re.match(r"^calculate\s+(.+)$", normalized, re.IGNORECASE)
+
+    if explicit:
+        return explicit.group(1).strip()
+
+    question = re.match(r"^what\s+is\s+(.+)$", normalized, re.IGNORECASE)
+
+    if question:
+        candidate = question.group(1).strip()
+
+        if re.fullmatch(r"[\d\s+\-*/%().]+", candidate):
+            return candidate
+
+        return None
+
+    if re.fullmatch(r"[\d\s+\-*/%().]+", normalized):
+        return normalized
+
+    return None
+
+
+def calculate_expression(expression):
+    # Parse arithmetic without eval(), then allow only numeric literals and
+    # the supported binary/unary operators.
+    if not expression or len(expression) > 200:
+        raise ValueError("unsafe expression")
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise ValueError("invalid expression") from error
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool)
+        ):
+            return node.value
+
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = evaluate(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+
+        if isinstance(node, ast.BinOp) and type(node.op) in CALCULATOR_OPERATORS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("exponent is too large")
+
+            result = CALCULATOR_OPERATORS[type(node.op)](left, right)
+
+            if abs(result) > 10 ** 100:
+                raise ValueError("result is too large")
+
+            return result
+
+        raise ValueError("unsafe expression")
+
+    return evaluate(tree)
+
+
+def format_calculator_result(result):
+    if isinstance(result, float) and result.is_integer():
+        return str(int(result))
+
+    return str(result)
+
+
+class ComradeBot(irc.bot.SingleServerIRCBot):
+
+    def __init__(self):
+        context = ssl.create_default_context()
+
+        wrapper = functools.partial(
+            context.wrap_socket,
+            server_hostname="irc.rizon.net",
+        )
+
+        factory = irc.connection.Factory(wrapper=wrapper)
+
+        super().__init__(
+            [("irc.rizon.net", 6697)],
+            NICK,
+            NICK,
+            connect_factory=factory,
+        )
+
+    def on_welcome(self, connection, event):
+        print("Connected to Rizon.")
+
+        if PASSWORD:
+            print("Identifying with NickServ.")
+            connection.privmsg("NickServ", f"IDENTIFY {PASSWORD}")
+
+        print(f"Joining {CHANNEL}.")
+        connection.join(CHANNEL)
+
+    def on_pubmsg(self, connection, event):
+        nick = event.source.nick
+        channel = event.target
+        message = event.arguments[0]
+
+        print(f"DEBUG {nick}: {message}")
+
+        search_query = extract_search_query(message)
+
+        if search_query is not None:
+            if not search_query:
+                connection.privmsg(channel, f"{nick}: usage: !search <query>")
+                return
+
+            print(f"SEARCH from {nick}: {search_query}")
+
+            def search_worker():
+                try:
+                    results = search_tavily(search_query)
+
+                    if not results:
+                        connection.privmsg(channel, f"{nick}: no search results")
+                        return
+
+                    lines = []
+
+                    for index, result in enumerate(results[:3], start=1):
+                        title = " ".join(result.get("title", "Untitled").split())
+                        url = result.get("url", "")
+                        lines.append(f"{nick}: {index}. {title} - {url}")
+
+                    send_lines(connection, channel, lines)
+
+                except Exception as e:
+                    print(f"SEARCH ERROR: {e}")
+                    connection.privmsg(channel, f"{nick}: search failed")
+
+            threading.Thread(target=search_worker, daemon=True).start()
+            return
+
+        # Outgoing replies are stored when sent. Ignore any server echo of
+        # those replies so each bot message appears in memory only once.
+        if nick.casefold() != NICK.casefold():
+            store_message(NETWORK, channel, nick, message)
+
+        prompt = extract_prompt(message)
+
+        if not prompt:
+            return
+
+        print(f"PROMPT from {nick}: {prompt}")
+
+        datetime_request = get_datetime_request(prompt)
+
+        if datetime_request:
+            reply_message = f"{nick}: {format_datetime_reply(datetime_request)}"
+            connection.privmsg(channel, reply_message)
+            store_message(NETWORK, channel, NICK, reply_message)
+            return
+
+        calculator_expression = extract_calculator_expression(prompt)
+
+        if calculator_expression is not None:
+            try:
+                result = calculate_expression(calculator_expression)
+                result_text = format_calculator_result(result)
+                reply_message = f"{nick}: {calculator_expression} = {result_text}"
+            except (ArithmeticError, ValueError) as e:
+                print(f"CALCULATOR ERROR: {e}")
+                reply_message = f"{nick}: invalid or unsafe calculation"
+
+            connection.privmsg(channel, reply_message)
+            store_message(NETWORK, channel, NICK, reply_message)
+            return
+
+        def worker():
+            try:
+                reply = ask_llm(prompt, NETWORK, channel)
+                reply_lines = [
+                    f"{nick}: {line}"
+                    for line in split_message(reply)
+                ]
+                send_lines(
+                    connection,
+                    channel,
+                    reply_lines,
+                    on_send=lambda line: store_message(
+                        NETWORK,
+                        channel,
+                        NICK,
+                        line,
+                    ),
+                )
+
+            except Exception as e:
+                print(f"ERROR: {e}")
+                error_message = f"{nick}: error talking to Ollama"
+                connection.privmsg(channel, error_message)
+                store_message(NETWORK, channel, NICK, error_message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    initialize_database()
+
+    print(f"Starting {NICK}")
+    print(f"Channel: {CHANNEL}")
+    print(f"Model: {OLLAMA_MODEL}")
+
+    bot = ComradeBot()
+    bot.start()
