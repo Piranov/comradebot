@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/animekindergarten-bot
-EnvironmentFile=%h/animekindergarten-bot/%i.env
+WorkingDirectory=%h/projects/comradebot
+EnvironmentFile=%h/projects/comradebot/%i.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=%h/animekindergarten-bot/.venv/bin/python %h/animekindergarten-bot/bot.py
+ExecStart=%h/projects/comradebot/.venv/bin/python %h/projects/comradebot/bot.py
 Restart=on-failure
 RestartSec=5
 
