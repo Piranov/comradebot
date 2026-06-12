@@ -11,6 +11,7 @@ In addition to normal LLM conversation, ComradeBot has built-in tools for web
 search, channel summaries, arithmetic, local date and time, and runtime status.
 
 Its personality can be changed with a simple text-based system prompt.
+Make it the bitter channel babushka, anxious robot or cybercop!
 
 ## Features
 
