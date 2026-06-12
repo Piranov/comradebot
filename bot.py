@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 from datetime import datetime
+from collections import defaultdict, deque
 import ast
+import math
 import os
 import ssl
 import functools
@@ -60,14 +62,41 @@ OLLAMA_SUMMARY_NUM_PREDICT = int(
     os.getenv("OLLAMA_SUMMARY_NUM_PREDICT", "120")
 )
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "").strip()
-ADMIN_NICKS = {
+ADMIN_ACCOUNTS = {
+    account.strip().casefold()
+    for account in os.getenv("ADMIN_ACCOUNTS", "").split(",")
+    if account.strip()
+}
+AI_ALLOWED_ACCOUNTS = {
+    account.strip().casefold()
+    for account in os.getenv("AI_ALLOWED_ACCOUNTS", "").split(",")
+    if account.strip()
+}
+AI_ALLOWED_NICKS = {
     nick.strip().casefold()
-    for nick in os.getenv("ADMIN_NICKS", "").split(",")
+    for nick in os.getenv("AI_ALLOWED_NICKS", "").split(",")
     if nick.strip()
 }
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 TAVILY_URL = "https://api.tavily.com/search"
+
+AI_RATE_LIMIT_WINDOW = int(os.getenv("AI_RATE_LIMIT_WINDOW", "60"))
+AI_USER_RATE_LIMIT = int(os.getenv("AI_USER_RATE_LIMIT", "3"))
+AI_CHANNEL_RATE_LIMIT = int(os.getenv("AI_CHANNEL_RATE_LIMIT", "10"))
+
+if min(
+    AI_RATE_LIMIT_WINDOW,
+    AI_USER_RATE_LIMIT,
+    AI_CHANNEL_RATE_LIMIT,
+) <= 0:
+    raise RuntimeError(
+        "AI rate limit values must be positive integers"
+    )
+
+AI_RATE_LIMIT_LOCK = threading.Lock()
+AI_USER_REQUESTS = defaultdict(deque)
+AI_CHANNEL_REQUESTS = defaultdict(deque)
 
 CALCULATOR_OPERATORS = {
     ast.Add: lambda left, right: left + right,
@@ -191,6 +220,94 @@ def get_status():
         f"Network: {IRC_NETWORK} | Uptime: {format_uptime(elapsed)} | "
         f"Model: {OLLAMA_MODEL}"
     )
+
+
+def check_ai_rate_limit(nick, channel, now=None):
+    current_time = time.monotonic() if now is None else now
+    cutoff = current_time - AI_RATE_LIMIT_WINDOW
+    user_key = (IRC_NETWORK.casefold(), nick.casefold())
+    channel_key = (IRC_NETWORK.casefold(), channel.casefold())
+
+    with AI_RATE_LIMIT_LOCK:
+        user_requests = AI_USER_REQUESTS[user_key]
+        channel_requests = AI_CHANNEL_REQUESTS[channel_key]
+
+        while user_requests and user_requests[0] <= cutoff:
+            user_requests.popleft()
+
+        while channel_requests and channel_requests[0] <= cutoff:
+            channel_requests.popleft()
+
+        if len(user_requests) >= AI_USER_RATE_LIMIT:
+            retry_after = math.ceil(
+                AI_RATE_LIMIT_WINDOW - (current_time - user_requests[0])
+            )
+            return "user", max(1, retry_after)
+
+        if len(channel_requests) >= AI_CHANNEL_RATE_LIMIT:
+            retry_after = math.ceil(
+                AI_RATE_LIMIT_WINDOW - (current_time - channel_requests[0])
+            )
+            return "channel", max(1, retry_after)
+
+        user_requests.append(current_time)
+        channel_requests.append(current_time)
+
+    return None
+
+
+def enforce_ai_rate_limit(connection, nick, channel):
+    limit = check_ai_rate_limit(nick, channel)
+
+    if limit is None:
+        return True
+
+    scope, retry_after = limit
+    print(
+        f"AI request rate-limited for {nick} in {channel}: "
+        f"{scope} limit."
+    )
+    connection.privmsg(
+        channel,
+        f"{nick}: AI rate limit reached ({scope}); "
+        f"try again in {retry_after}s",
+    )
+    return False
+
+
+def get_event_account(event):
+    for tag in event.tags:
+        if tag.get("key") == "account":
+            account = tag.get("value")
+            return None if not account or account == "*" else account
+
+    return False
+
+
+def check_ai_acl(event, nick):
+    if not AI_ALLOWED_ACCOUNTS and not AI_ALLOWED_NICKS:
+        return True
+
+    if nick.casefold() in AI_ALLOWED_NICKS:
+        return True
+
+    account = get_event_account(event)
+    return bool(
+        account
+        and account.casefold() in AI_ALLOWED_ACCOUNTS
+    )
+
+
+def enforce_ai_acl(connection, event, nick, channel):
+    if check_ai_acl(event, nick):
+        return True
+
+    print(f"AI request denied by ACL for {nick} in {channel}.")
+    connection.privmsg(
+        channel,
+        f"{nick}: you are not authorized to use AI commands",
+    )
+    return False
 
 
 def initialize_database():
@@ -646,6 +763,10 @@ def format_calculator_result(result):
 class ComradeBot(irc.bot.SingleServerIRCBot):
 
     def __init__(self):
+        self.pending_admin_commands = defaultdict(list)
+        self.whois_accounts = {}
+        self.whois_identities = {}
+
         if IRC_TLS:
             context = ssl.create_default_context()
 
@@ -671,6 +792,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
     def on_welcome(self, connection, event):
         print(f"Connected to {IRC_NETWORK} ({IRC_SERVER}:{IRC_PORT}).")
+        connection.cap("REQ", "account-tag")
 
         if IRC_PASSWORD:
             print("Identifying with NickServ.")
@@ -692,12 +814,95 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         reason = " ".join(event.arguments) if event.arguments else "unknown error"
         print(f"IRC connection error: {reason}")
 
+    def run_reload_prompt(self, connection, nick, channel, account):
+        if account.casefold() not in ADMIN_ACCOUNTS:
+            print(
+                f"Prompt reload denied for {nick} in {channel}: "
+                f"unauthorized account {account}."
+            )
+            connection.privmsg(
+                channel,
+                f"{nick}: NickServ account is not authorized",
+            )
+            return
+
+        try:
+            reload_system_prompt()
+            print(
+                f"System prompt reloaded by {nick} "
+                f"(account {account})."
+            )
+            connection.privmsg(channel, "Prompt reloaded.")
+        except Exception as e:
+            print(f"PROMPT RELOAD ERROR: {e}")
+            connection.privmsg(
+                channel,
+                "Prompt reload failed; check the bot logs",
+            )
+
+    def request_admin_verification(
+        self,
+        connection,
+        nick,
+        channel,
+        user,
+        host,
+    ):
+        nick_key = nick.casefold()
+        self.pending_admin_commands[nick_key].append(
+            (nick, channel, user, host)
+        )
+
+        if len(self.pending_admin_commands[nick_key]) == 1:
+            print(f"Requesting NickServ account verification for {nick}.")
+            connection.whois([nick])
+
+    def on_whoisuser(self, connection, event):
+        if len(event.arguments) < 3:
+            return
+
+        nick, user, host = event.arguments[:3]
+        self.whois_identities[nick.casefold()] = (user, host)
+
+    def on_whoisaccount(self, connection, event):
+        if len(event.arguments) < 2:
+            return
+
+        nick, account = event.arguments[:2]
+        self.whois_accounts[nick.casefold()] = account
+
+    def on_endofwhois(self, connection, event):
+        if not event.arguments:
+            return
+
+        nick_key = event.arguments[0].casefold()
+        pending_commands = self.pending_admin_commands.pop(nick_key, [])
+        account = self.whois_accounts.pop(nick_key, None)
+        whois_identity = self.whois_identities.pop(nick_key, None)
+
+        for nick, channel, user, host in pending_commands:
+            if account and whois_identity == (user, host):
+                self.run_reload_prompt(
+                    connection,
+                    nick,
+                    channel,
+                    account,
+                )
+            else:
+                print(
+                    f"Prompt reload denied for {nick} in {channel}: "
+                    "NickServ account could not be verified."
+                )
+                connection.privmsg(
+                    channel,
+                    f"{nick}: identify with NickServ before using "
+                    "!reload_prompt",
+                )
+
     def on_pubmsg(self, connection, event):
         nick = event.source.nick
         channel = event.target
         message = event.arguments[0]
-
-        print(f"DEBUG {nick}: {message}")
 
         if is_model_command(message):
             connection.privmsg(channel, get_model_settings())
@@ -718,6 +923,12 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             return
 
         if summary_count is not None:
+            if not enforce_ai_acl(connection, event, nick, channel):
+                return
+
+            if not enforce_ai_rate_limit(connection, nick, channel):
+                return
+
             print(
                 f"SUMMARY from {nick}: last {summary_count} messages "
                 f"in {channel}"
@@ -749,17 +960,32 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             return
 
         if is_reload_prompt_command(message):
-            # Admin nick matching is case-insensitive, like normal IRC nick use.
-            if nick.casefold() not in ADMIN_NICKS:
+            if not ADMIN_ACCOUNTS:
                 return
 
-            try:
-                reload_system_prompt()
-                print(f"System prompt reloaded by {nick}.")
-                connection.privmsg(channel, "Prompt reloaded.")
-            except Exception as e:
-                print(f"PROMPT RELOAD ERROR: {e}")
-                connection.privmsg(channel, f"Prompt reload failed: {e}")
+            account = get_event_account(event)
+
+            if account is False:
+                self.request_admin_verification(
+                    connection,
+                    nick,
+                    channel,
+                    event.source.user,
+                    event.source.host,
+                )
+            elif account is None:
+                connection.privmsg(
+                    channel,
+                    f"{nick}: identify with NickServ before using "
+                    "!reload_prompt",
+                )
+            else:
+                self.run_reload_prompt(
+                    connection,
+                    nick,
+                    channel,
+                    account,
+                )
 
             return
 
@@ -770,7 +996,13 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                 connection.privmsg(channel, f"{nick}: usage: !search <query>")
                 return
 
-            print(f"SEARCH from {nick}: {search_query}")
+            if not enforce_ai_acl(connection, event, nick, channel):
+                return
+
+            if not enforce_ai_rate_limit(connection, nick, channel):
+                return
+
+            print(f"Search requested by {nick} in {channel}.")
 
             def search_worker():
                 try:
@@ -806,8 +1038,6 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         if not prompt:
             return
 
-        print(f"PROMPT from {nick}: {prompt}")
-
         datetime_request = get_datetime_request(prompt)
 
         if datetime_request:
@@ -830,6 +1060,14 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             connection.privmsg(channel, reply_message)
             store_message(IRC_NETWORK, channel, IRC_NICK, reply_message)
             return
+
+        if not enforce_ai_acl(connection, event, nick, channel):
+            return
+
+        if not enforce_ai_rate_limit(connection, nick, channel):
+            return
+
+        print(f"LLM response requested by {nick} in {channel}.")
 
         def worker():
             try:
@@ -882,6 +1120,18 @@ if __name__ == "__main__":
     print(f"Ollama summary num_predict: {OLLAMA_SUMMARY_NUM_PREDICT}")
     print(f"Ollama summary temperature: {OLLAMA_SUMMARY_TEMPERATURE}")
     print(f"Ollama summary top_p: {OLLAMA_SUMMARY_TOP_P}")
+    print(
+        f"AI rate limits: {AI_USER_RATE_LIMIT}/user, "
+        f"{AI_CHANNEL_RATE_LIMIT}/channel per "
+        f"{AI_RATE_LIMIT_WINDOW}s"
+    )
+    if AI_ALLOWED_ACCOUNTS or AI_ALLOWED_NICKS:
+        print(
+            f"AI command ACL enabled: {len(AI_ALLOWED_ACCOUNTS)} "
+            f"accounts, {len(AI_ALLOWED_NICKS)} nicknames"
+        )
+    else:
+        print("AI command ACL: public")
     if LOADED_SYSTEM_PROMPT_FILE:
         print(f"System prompt file: {LOADED_SYSTEM_PROMPT_FILE}")
     elif SYSTEM_PROMPT_FILE:
@@ -892,7 +1142,6 @@ if __name__ == "__main__":
     else:
         print("System prompt: built-in fallback")
     print("Summary prompt: built-in")
-    print(SUMMARY_SYSTEM_PROMPT)
 
     try:
         bot = ComradeBot()

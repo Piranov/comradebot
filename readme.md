@@ -33,7 +33,7 @@ Commands can be entered directly in the channel and are case-insensitive.
 | `!summary` | Summarizes the last 50 stored channel messages. |
 | `!summary <count>` | Summarizes a requested number of messages, clamped to 10-200. |
 | `!search <query>` | Returns up to three Tavily web search results. |
-| `!reload_prompt` | Reloads `SYSTEM_PROMPT_FILE`; ignored unless the sender is listed in `ADMIN_NICKS`. |
+| `!reload_prompt` | Reloads `SYSTEM_PROMPT_FILE` after verifying an authorized NickServ account. |
 
 ### Talking to the bot
 
@@ -76,7 +76,7 @@ Install the Python dependencies in a virtual environment:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install irc python-dotenv requests
+.venv/bin/pip install -r requirements.txt
 ```
 
 Ensure Ollama is running and has the desired model:
@@ -114,8 +114,14 @@ OLLAMA_SUMMARY_NUM_PREDICT=120
 OLLAMA_SUMMARY_TEMPERATURE=0.1
 OLLAMA_SUMMARY_TOP_P=0.6
 
+AI_RATE_LIMIT_WINDOW=60
+AI_USER_RATE_LIMIT=3
+AI_CHANNEL_RATE_LIMIT=10
+AI_ALLOWED_ACCOUNTS=
+AI_ALLOWED_NICKS=
+
 SYSTEM_PROMPT_FILE=/home/your-user/projects/comradebot/system_prompt.txt
-ADMIN_NICKS=YourNick,AnotherAdmin
+ADMIN_ACCOUNTS=YourNickServAccount,AnotherAccount
 TAVILY_API_KEY=
 ```
 
@@ -141,12 +147,29 @@ TAVILY_API_KEY=
 | `OLLAMA_SUMMARY_NUM_PREDICT` | No | `120` | Maximum tokens for summaries. |
 | `OLLAMA_SUMMARY_TEMPERATURE` | No | `0.1` | Temperature for summaries. |
 | `OLLAMA_SUMMARY_TOP_P` | No | `0.6` | Top-p value for summaries. |
+| `AI_RATE_LIMIT_WINDOW` | No | `60` | Sliding rate-limit window in seconds. |
+| `AI_USER_RATE_LIMIT` | No | `3` | AI requests allowed per nickname in each window. |
+| `AI_CHANNEL_RATE_LIMIT` | No | `10` | AI requests allowed per channel in each window. |
+| `AI_ALLOWED_ACCOUNTS` | No | None | Comma-separated NickServ accounts allowed to use AI commands. |
+| `AI_ALLOWED_NICKS` | No | None | Comma-separated nicknames allowed to use AI commands. |
 | `SYSTEM_PROMPT_FILE` | No | Built-in prompt | Path to a custom personality prompt. |
-| `ADMIN_NICKS` | No | None | Comma-separated nicknames allowed to reload the prompt. |
+| `ADMIN_ACCOUNTS` | No | None | Comma-separated NickServ accounts allowed to reload the prompt. |
 | `TAVILY_API_KEY` | For search | None | Enables the `!search` command. |
 
 Keep environment files private because they may contain IRC and API
 credentials. Files ending in `.env` are ignored by the included `.gitignore`.
+
+Addressed LLM prompts, `!summary`, and `!search` share the configured per-user
+and per-channel rate limits. Requests rejected by either limit do not start an
+Ollama or Tavily request. Status, date/time, and calculator commands are not
+rate-limited.
+
+AI commands are public when both `AI_ALLOWED_ACCOUNTS` and `AI_ALLOWED_NICKS`
+are empty. Setting either variable enables an allowlist: a user must match an
+allowed NickServ account reported through IRCv3 `account-tag`, or an explicitly
+allowed nickname. Account entries are safer because nicknames may be changed
+or impersonated. ACL checks happen before rate-limit accounting and before any
+Ollama or Tavily request.
 
 ## Running
 
@@ -192,20 +215,63 @@ systemctl --user stop comradebot@rizon.service
 The paths in the service file assume the repository is located at
 `~/projects/comradebot`.
 
-## Message history
+## Data retention and privacy
 
-Channel messages are stored in `comradebot.db`. History is separated by IRC
-network and channel, and only the newest 500 messages for each pair are kept.
-Normal LLM replies receive the latest 30 messages as context. `!summary` reads
-the requested number of messages from the same history.
+ComradeBot records channel activity to `comradebot.db`, a local SQLite
+database in the bot's working directory. Each record contains the IRC network,
+channel, nickname, timestamp, and message text. Bot replies are stored as well
+as messages from other channel participants.
+
+History is separated by network and channel. After each insert, the bot keeps
+only the newest 500 records for that network/channel pair. Normal LLM requests
+include up to the latest 30 records from the current channel. `!summary`
+includes the requested number of records, between 10 and 200. Restarting the
+bot does not clear this history.
+
+SQLite data is stored as unencrypted plain text. Deleting rows does not
+guarantee immediate forensic removal from the database file, filesystem,
+backups, snapshots, or SQLite sidecar files. Stop the bot before deleting the
+database when a complete history reset is required. Database files and their
+`-wal`, `-shm`, and journal sidecars are excluded by `.gitignore` and must
+never be committed.
+
+Restrict access to the bot account and runtime files. A typical installation
+should use permissions such as:
+
+```bash
+chmod 600 .env *.env comradebot.db
+```
+
+The bot's operational logs include connection status, channel names,
+requesting nicknames, command types, and error details. They do not
+intentionally log complete channel messages, prompts, or search queries.
+When run through systemd, these logs are retained by the system journal
+according to the host's journald configuration.
+
+### Ollama data flow
+
+When someone addresses the bot, ComradeBot sends the system prompt, their
+prompt, and up to 30 recent messages from that channel to `OLLAMA_URL`.
+`!summary` sends up to 200 stored channel messages. The default Ollama URL is
+local, but operators can configure a remote endpoint. A remote Ollama server
+receives this channel content in plain application payloads and may apply its
+own logging, retention, or privacy policy. Use HTTPS and a trusted endpoint
+when Ollama is not running on the same machine.
+
+### Tavily data flow
+
+The `!search` command sends the user's search query to the Tavily Search API.
+Recent channel history is not included. Tavily may process or retain queries
+under its own terms and privacy policy. Leave `TAVILY_API_KEY` unset if search
+queries must not be sent to a third party.
+
+Operators should disclose this logging and external processing to channel
+participants, obtain any consent required by local law or community policy,
+and choose retention and backup practices appropriate for the channel.
 
 To join multiple channels on one network, list them in that network's
 environment file separated by commas, for example
 `IRC_CHANNEL=#example,#another-channel`. A single channel remains supported.
-
-Messages are stored in plain text. Anyone operating the bot should treat the
-database as channel logs and apply the privacy and retention expectations of
-the IRC community where it is used.
 
 ## System prompt
 
@@ -220,5 +286,16 @@ bot:
 !reload_prompt
 ```
 
+The sender must be logged into an account listed in `ADMIN_ACCOUNTS`. The bot
+uses the IRCv3 `account-tag` capability where available and falls back to a
+WHOIS account lookup. Nicknames alone are never accepted as proof of
+authorization.
+
 If the configured file is missing during startup, ComradeBot falls back to its
 built-in prompt. The summary prompt is separate and built into `bot.py`.
+
+## License
+
+ComradeBot is free software licensed under the
+[GNU General Public License, version 3 or later](LICENSE). You may use, modify,
+and redistribute it under the terms of that license.
