@@ -22,7 +22,13 @@ IRC_NETWORK = os.getenv("IRC_NETWORK", "").strip()
 IRC_SERVER = os.getenv("IRC_SERVER", "").strip()
 IRC_PORT = int(os.getenv("IRC_PORT", "6697"))
 IRC_TLS_VALUE = os.getenv("IRC_TLS", "true").strip().casefold()
-IRC_CHANNEL = os.getenv("IRC_CHANNEL", "").strip()
+IRC_CHANNELS = tuple(
+    dict.fromkeys(
+        channel.strip()
+        for channel in os.getenv("IRC_CHANNEL", "").split(",")
+        if channel.strip()
+    )
+)
 IRC_NICK = os.getenv("IRC_NICK", "ComradeBot")
 IRC_PASSWORD = os.getenv("IRC_PASSWORD")
 
@@ -33,7 +39,7 @@ elif IRC_TLS_VALUE in {"false", "0", "no", "off"}:
 else:
     raise RuntimeError("IRC_TLS must be true or false")
 
-if not IRC_NETWORK or not IRC_SERVER or not IRC_CHANNEL:
+if not IRC_NETWORK or not IRC_SERVER or not IRC_CHANNELS:
     raise RuntimeError(
         "IRC_NETWORK, IRC_SERVER, and IRC_CHANNEL must be configured"
     )
@@ -670,8 +676,9 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             print("Identifying with NickServ.")
             connection.privmsg("NickServ", f"IDENTIFY {IRC_PASSWORD}")
 
-        print(f"Joining {IRC_CHANNEL}.")
-        connection.join(IRC_CHANNEL)
+        for channel in IRC_CHANNELS:
+            print(f"Joining {channel}.")
+            connection.join(channel)
 
     def on_join(self, connection, event):
         if event.source.nick == connection.get_nickname():
@@ -864,7 +871,7 @@ if __name__ == "__main__":
     print(f"Network: {IRC_NETWORK}")
     print(f"Server: {IRC_SERVER}:{IRC_PORT}")
     print(f"TLS: {'enabled' if IRC_TLS else 'disabled'}")
-    print(f"Channel: {IRC_CHANNEL}")
+    print(f"Channels: {', '.join(IRC_CHANNELS)}")
     print(f"Model: {OLLAMA_MODEL}")
     print(f"Ollama num_ctx: {OLLAMA_NUM_CTX}")
     print(f"Ollama num_predict: {OLLAMA_NUM_PREDICT}")

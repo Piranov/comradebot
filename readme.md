@@ -97,7 +97,7 @@ IRC_NETWORK=ExampleNet
 IRC_SERVER=irc.example.net
 IRC_PORT=6697
 IRC_TLS=true
-IRC_CHANNEL=#example
+IRC_CHANNEL=#example,#another-channel
 IRC_NICK=ComradeBot
 IRC_PASSWORD=
 
@@ -125,7 +125,7 @@ TAVILY_API_KEY=
 | --- | --- | --- | --- |
 | `IRC_NETWORK` | Yes | None | Display name used to separate history and report status. |
 | `IRC_SERVER` | Yes | None | IRC server hostname. |
-| `IRC_CHANNEL` | Yes | None | Channel to join. |
+| `IRC_CHANNEL` | Yes | None | Comma-separated channels to join. |
 | `IRC_PORT` | No | `6697` | IRC server port. |
 | `IRC_TLS` | No | `true` | Enables or disables TLS. |
 | `IRC_NICK` | No | `ComradeBot` | Bot nickname and address prefix. |
@@ -198,6 +198,10 @@ Channel messages are stored in `comradebot.db`. History is separated by IRC
 network and channel, and only the newest 500 messages for each pair are kept.
 Normal LLM replies receive the latest 30 messages as context. `!summary` reads
 the requested number of messages from the same history.
+
+To join multiple channels on one network, list them in that network's
+environment file separated by commas, for example
+`IRC_CHANNEL=#example,#another-channel`. A single channel remains supported.
 
 Messages are stored in plain text. Anyone operating the bot should treat the
 database as channel logs and apply the privacy and retention expectations of
