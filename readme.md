@@ -1,13 +1,16 @@
 # ComradeBot
 
-ComradeBot is a lightweight IRC bot backed by a local language model served
-through [Ollama](https://ollama.com/). It joins a configured channel, keeps a
-small per-channel message history in SQLite, and replies when users address it
-by nickname.
+A self-hosted IRC bot powered by [Ollama](https://ollama.com/).
+
+Built because IRC is still alive, local LLMs are fun, and sometimes a channel needs an opinionated robot comrade.
+
+It joins a configured channel, keeps a small per-channel message
+history in SQLite, and replies when users address it by nickname.
 
 In addition to normal LLM conversation, ComradeBot has built-in tools for web
 search, channel summaries, arithmetic, local date and time, and runtime status.
-Its personality can be changed with a text-based system prompt.
+
+Its personality can be changed with a simple text-based system prompt.
 
 ## Features
 
@@ -82,7 +85,7 @@ python3 -m venv .venv
 Ensure Ollama is running and has the desired model:
 
 ```bash
-ollama pull dolphin-mistral
+ollama pull <your_model>
 ```
 
 ## Configuration
