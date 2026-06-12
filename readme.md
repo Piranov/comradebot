@@ -101,7 +101,7 @@ IRC_SERVER=irc.example.net
 IRC_PORT=6697
 IRC_TLS=true
 IRC_CHANNEL=#example,#another-channel
-IRC_NICK=ComradeBot
+IRC_NICK=BotName
 IRC_PASSWORD=
 
 OLLAMA_URL=http://localhost:11434/api/chat
