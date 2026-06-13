@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from collections import defaultdict, deque
 import ast
+import difflib
 import math
 import os
 import ssl
@@ -14,6 +15,12 @@ import sqlite3
 import requests
 import irc.bot
 import irc.connection
+
+from model_response import (
+    clean_model_response,
+    parse_think_setting,
+    strip_nick_prefix,
+)
 
 PROCESS_START_TIME = time.monotonic()
 
@@ -52,6 +59,7 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "160"))
 OLLAMA_NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "-1"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OLLAMA_THINK = parse_think_setting(os.getenv("OLLAMA_THINK", "false"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.7"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
 OLLAMA_SUMMARY_TEMPERATURE = float(
@@ -98,6 +106,13 @@ AI_RATE_LIMIT_LOCK = threading.Lock()
 AI_USER_REQUESTS = defaultdict(deque)
 AI_CHANNEL_REQUESTS = defaultdict(deque)
 
+CHAT_HISTORY_FETCH_LIMIT = 40
+CHAT_HISTORY_MAX_MESSAGES = 12
+CHAT_HISTORY_MAX_BOT_MESSAGES = 2
+CHAT_HISTORY_BOT_MESSAGE_MAX_CHARS = 160
+RECENT_BOT_REPLY_LIMIT = 8
+NEAR_DUPLICATE_THRESHOLD = 0.84
+
 CALCULATOR_OPERATORS = {
     ast.Add: lambda left, right: left + right,
     ast.Sub: lambda left, right: left - right,
@@ -114,6 +129,7 @@ You are chatting in a casual anime/nerd IRC channel.
 Keep replies short, funny, and conversational.
 Avoid markdown.
 Avoid huge walls of text.
+Do not begin replies with the user's nickname or a nickname label.
 Do not pretend to know things you do not know.
 """.strip()
 
@@ -183,7 +199,8 @@ def is_model_command(message):
 def get_model_settings():
     return (
         f"Model: {OLLAMA_MODEL} | temp={OLLAMA_TEMPERATURE} | "
-        f"top_p={OLLAMA_TOP_P} | ctx={OLLAMA_NUM_CTX}"
+        f"top_p={OLLAMA_TOP_P} | ctx={OLLAMA_NUM_CTX} | "
+        f"think={str(OLLAMA_THINK).lower()}"
     )
 
 
@@ -269,7 +286,7 @@ def enforce_ai_rate_limit(connection, nick, channel):
     )
     connection.privmsg(
         channel,
-        f"{nick}: AI rate limit reached ({scope}); "
+        f"AI rate limit reached ({scope}); "
         f"try again in {retry_after}s",
     )
     return False
@@ -305,7 +322,7 @@ def enforce_ai_acl(connection, event, nick, channel):
     print(f"AI request denied by ACL for {nick} in {channel}.")
     connection.privmsg(
         channel,
-        f"{nick}: you are not authorized to use AI commands",
+        "You are not authorized to use AI commands",
     )
     return False
 
@@ -371,7 +388,7 @@ def store_message(network, channel, nick, message):
         )
 
 
-def get_channel_context(network, channel, limit=30):
+def get_channel_history(network, channel, limit=CHAT_HISTORY_FETCH_LIMIT):
     with sqlite3.connect(DATABASE) as connection:
         rows = connection.execute(
             """
@@ -386,9 +403,145 @@ def get_channel_context(network, channel, limit=30):
         ).fetchall()
 
     rows.reverse()
+    return rows
+
+
+def shorten_bot_history_message(message, max_chars):
+    compact = " ".join(message.split())
+
+    if len(compact) <= max_chars:
+        return compact
+
+    shortened = compact[:max_chars].rsplit(" ", 1)[0].rstrip()
+    return f"{shortened or compact[:max_chars].rstrip()}..."
+
+
+def trim_chat_history(
+    rows,
+    bot_nick,
+    max_messages=CHAT_HISTORY_MAX_MESSAGES,
+    max_bot_messages=CHAT_HISTORY_MAX_BOT_MESSAGES,
+    bot_message_max_chars=CHAT_HISTORY_BOT_MESSAGE_MAX_CHARS,
+    exclude_latest=None,
+):
+    selected = []
+    bot_messages = 0
+    excluded = False
+
+    for timestamp, nick, message in reversed(rows):
+        if (
+            exclude_latest
+            and not excluded
+            and nick.casefold() == exclude_latest[0].casefold()
+            and message == exclude_latest[1]
+        ):
+            excluded = True
+            continue
+
+        is_bot = nick.casefold() == bot_nick.casefold()
+
+        if is_bot:
+            if bot_messages >= max_bot_messages:
+                continue
+
+            message = shorten_bot_history_message(
+                message,
+                bot_message_max_chars,
+            )
+            bot_messages += 1
+
+        selected.append((timestamp, nick, message))
+
+        if len(selected) >= max_messages:
+            break
+
+    selected.reverse()
+    return selected
+
+
+def format_chat_history(rows):
     return "\n".join(
         f"[{timestamp}] {nick}: {message}"
         for timestamp, nick, message in rows
+    )
+
+
+def get_channel_context(network, channel, exclude_latest=None):
+    rows = get_channel_history(network, channel)
+    trimmed_rows = trim_chat_history(
+        rows,
+        IRC_NICK,
+        exclude_latest=exclude_latest,
+    )
+    return format_chat_history(trimmed_rows)
+
+
+def get_recent_bot_replies(
+    network,
+    channel,
+    limit=RECENT_BOT_REPLY_LIMIT,
+):
+    with sqlite3.connect(DATABASE) as connection:
+        rows = connection.execute(
+            """
+            SELECT message
+            FROM channel_messages
+            WHERE network = ?
+              AND channel = ?
+              AND nick = ? COLLATE NOCASE
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (network, channel, IRC_NICK, limit),
+        ).fetchall()
+
+    return [message for (message,) in rows]
+
+
+def normalize_reply_for_comparison(reply):
+    return " ".join(
+        re.findall(r"\w+", reply.casefold(), flags=re.UNICODE)
+    )
+
+
+def replies_are_near_duplicates(
+    candidate,
+    previous,
+    threshold=NEAR_DUPLICATE_THRESHOLD,
+):
+    candidate_normalized = normalize_reply_for_comparison(candidate)
+    previous_normalized = normalize_reply_for_comparison(previous)
+
+    if not candidate_normalized or not previous_normalized:
+        return False
+
+    if candidate_normalized == previous_normalized:
+        return True
+
+    similarity = difflib.SequenceMatcher(
+        None,
+        candidate_normalized,
+        previous_normalized,
+    ).ratio()
+
+    if similarity >= threshold:
+        return True
+
+    candidate_tokens = set(candidate_normalized.split())
+    previous_tokens = set(previous_normalized.split())
+    smaller_token_count = min(len(candidate_tokens), len(previous_tokens))
+
+    if smaller_token_count < 4:
+        return False
+
+    overlap = len(candidate_tokens & previous_tokens) / smaller_token_count
+    return overlap >= threshold
+
+
+def is_near_duplicate_reply(candidate, recent_replies):
+    return any(
+        replies_are_near_duplicates(candidate, previous)
+        for previous in recent_replies
     )
 
 
@@ -458,29 +611,17 @@ def summarize_channel(network, channel, count):
             "top_p": OLLAMA_SUMMARY_TOP_P,
         },
         "keep_alive": OLLAMA_KEEP_ALIVE,
+        "think": OLLAMA_THINK,
     }
 
     response = requests.post(OLLAMA_URL, json=payload, timeout=120)
     response.raise_for_status()
 
     data = response.json()
-    return data["message"]["content"].strip()
+    return clean_model_response(data["message"]["content"])
 
 
-def ask_llm(prompt, network, channel):
-    context = get_channel_context(network, channel)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    if context:
-        messages.append(
-            {
-                "role": "system",
-                "content": f"Recent IRC channel messages:\n{context}",
-            }
-        )
-
-    messages.append({"role": "user", "content": prompt})
-
+def request_ollama_chat(messages):
     payload = {
         "model": OLLAMA_MODEL,
         "stream": False,
@@ -493,13 +634,56 @@ def ask_llm(prompt, network, channel):
             "top_p": OLLAMA_TOP_P,
         },
         "keep_alive": OLLAMA_KEEP_ALIVE,
+        "think": OLLAMA_THINK,
     }
 
     response = requests.post(OLLAMA_URL, json=payload, timeout=120)
     response.raise_for_status()
 
     data = response.json()
-    return data["message"]["content"].strip()
+    return clean_model_response(data["message"]["content"])
+
+
+def ask_llm(prompt, network, channel, nick, source_message):
+    context = get_channel_context(
+        network,
+        channel,
+        exclude_latest=(nick, source_message),
+    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    if context:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Recent IRC channel messages for conversational "
+                    "continuity. Do not copy earlier bot wording or "
+                    f"catchphrases:\n{context}"
+                ),
+            }
+        )
+
+    messages.append({"role": "user", "content": prompt})
+    reply = strip_nick_prefix(request_ollama_chat(messages), nick)
+    recent_replies = get_recent_bot_replies(network, channel)
+
+    if not is_near_duplicate_reply(reply, recent_replies):
+        return reply
+
+    print("Generated reply matched recent bot history; retrying once.")
+    retry_messages = messages + [
+        {"role": "assistant", "content": reply},
+        {
+            "role": "user",
+            "content": (
+                "Rephrase that response with substantially different wording. "
+                "Avoid repeated jokes, catchphrases, and sentence patterns "
+                "from earlier IRC replies. Return only the revised reply."
+            ),
+        },
+    ]
+    return strip_nick_prefix(request_ollama_chat(retry_messages), nick)
 
 
 def search_tavily(query):
@@ -766,6 +950,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         self.pending_admin_commands = defaultdict(list)
         self.whois_accounts = {}
         self.whois_identities = {}
+        self.whois_identified_nicks = set()
 
         if IRC_TLS:
             context = ssl.create_default_context()
@@ -822,7 +1007,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             )
             connection.privmsg(
                 channel,
-                f"{nick}: NickServ account is not authorized",
+                "NickServ account is not authorized",
             )
             return
 
@@ -871,6 +1056,13 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         nick, account = event.arguments[:2]
         self.whois_accounts[nick.casefold()] = account
 
+    def on_307(self, connection, event):
+        if not event.arguments:
+            return
+
+        nick = event.arguments[0]
+        self.whois_identified_nicks.add(nick.casefold())
+
     def on_endofwhois(self, connection, event):
         if not event.arguments:
             return
@@ -879,14 +1071,20 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         pending_commands = self.pending_admin_commands.pop(nick_key, [])
         account = self.whois_accounts.pop(nick_key, None)
         whois_identity = self.whois_identities.pop(nick_key, None)
+        identified_for_nick = nick_key in self.whois_identified_nicks
+        self.whois_identified_nicks.discard(nick_key)
 
         for nick, channel, user, host in pending_commands:
-            if account and whois_identity == (user, host):
+            verified_account = account
+            if not verified_account and identified_for_nick:
+                verified_account = nick
+
+            if verified_account and whois_identity == (user, host):
                 self.run_reload_prompt(
                     connection,
                     nick,
                     channel,
-                    account,
+                    verified_account,
                 )
             else:
                 print(
@@ -895,8 +1093,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                 )
                 connection.privmsg(
                     channel,
-                    f"{nick}: identify with NickServ before using "
-                    "!reload_prompt",
+                    "Identify with NickServ before using !reload_prompt",
                 )
 
     def on_pubmsg(self, connection, event):
@@ -919,7 +1116,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         try:
             summary_count = extract_summary_count(message)
         except ValueError:
-            connection.privmsg(channel, f"{nick}: usage: !summary [10-200]")
+            connection.privmsg(channel, "Usage: !summary [10-200]")
             return
 
         if summary_count is not None:
@@ -945,7 +1142,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                     if not summary:
                         connection.privmsg(
                             channel,
-                            f"{nick}: no recent chat history",
+                            "No recent chat history",
                         )
                         return
 
@@ -954,7 +1151,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
                 except Exception as e:
                     print(f"SUMMARY ERROR: {e}")
-                    connection.privmsg(channel, f"{nick}: summary failed")
+                    connection.privmsg(channel, "Summary failed")
 
             threading.Thread(target=summary_worker, daemon=True).start()
             return
@@ -976,8 +1173,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             elif account is None:
                 connection.privmsg(
                     channel,
-                    f"{nick}: identify with NickServ before using "
-                    "!reload_prompt",
+                    "Identify with NickServ before using !reload_prompt",
                 )
             else:
                 self.run_reload_prompt(
@@ -993,7 +1189,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
         if search_query is not None:
             if not search_query:
-                connection.privmsg(channel, f"{nick}: usage: !search <query>")
+                connection.privmsg(channel, "Usage: !search <query>")
                 return
 
             if not enforce_ai_acl(connection, event, nick, channel):
@@ -1009,7 +1205,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                     results = search_tavily(search_query)
 
                     if not results:
-                        connection.privmsg(channel, f"{nick}: no search results")
+                        connection.privmsg(channel, "No search results")
                         return
 
                     lines = []
@@ -1017,13 +1213,13 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
                     for index, result in enumerate(results[:3], start=1):
                         title = " ".join(result.get("title", "Untitled").split())
                         url = result.get("url", "")
-                        lines.append(f"{nick}: {index}. {title} - {url}")
+                        lines.append(f"{index}. {title} - {url}")
 
                     send_lines(connection, channel, lines)
 
                 except Exception as e:
                     print(f"SEARCH ERROR: {e}")
-                    connection.privmsg(channel, f"{nick}: search failed")
+                    connection.privmsg(channel, "Search failed")
 
             threading.Thread(target=search_worker, daemon=True).start()
             return
@@ -1041,7 +1237,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
         datetime_request = get_datetime_request(prompt)
 
         if datetime_request:
-            reply_message = f"{nick}: {format_datetime_reply(datetime_request)}"
+            reply_message = format_datetime_reply(datetime_request)
             connection.privmsg(channel, reply_message)
             store_message(IRC_NETWORK, channel, IRC_NICK, reply_message)
             return
@@ -1052,10 +1248,10 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
             try:
                 result = calculate_expression(calculator_expression)
                 result_text = format_calculator_result(result)
-                reply_message = f"{nick}: {calculator_expression} = {result_text}"
+                reply_message = f"{calculator_expression} = {result_text}"
             except (ArithmeticError, ValueError) as e:
                 print(f"CALCULATOR ERROR: {e}")
-                reply_message = f"{nick}: invalid or unsafe calculation"
+                reply_message = "Invalid or unsafe calculation"
 
             connection.privmsg(channel, reply_message)
             store_message(IRC_NETWORK, channel, IRC_NICK, reply_message)
@@ -1071,11 +1267,14 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
         def worker():
             try:
-                reply = ask_llm(prompt, IRC_NETWORK, channel)
-                reply_lines = [
-                    f"{nick}: {line}"
-                    for line in split_message(reply)
-                ]
+                reply = ask_llm(
+                    prompt,
+                    IRC_NETWORK,
+                    channel,
+                    nick,
+                    message,
+                )
+                reply_lines = split_message(reply)
                 send_lines(
                     connection,
                     channel,
@@ -1090,7 +1289,7 @@ class ComradeBot(irc.bot.SingleServerIRCBot):
 
             except Exception as e:
                 print(f"ERROR: {e}")
-                error_message = f"{nick}: error talking to Ollama"
+                error_message = "Error talking to Ollama"
                 connection.privmsg(channel, error_message)
                 store_message(
                     IRC_NETWORK,
@@ -1115,6 +1314,7 @@ if __name__ == "__main__":
     print(f"Ollama num_predict: {OLLAMA_NUM_PREDICT}")
     print(f"Ollama num_gpu: {OLLAMA_NUM_GPU}")
     print(f"Ollama keep_alive: {OLLAMA_KEEP_ALIVE}")
+    print(f"Ollama think: {str(OLLAMA_THINK).lower()}")
     print(f"Ollama temperature: {OLLAMA_TEMPERATURE}")
     print(f"Ollama top_p: {OLLAMA_TOP_P}")
     print(f"Ollama summary num_predict: {OLLAMA_SUMMARY_NUM_PREDICT}")

@@ -17,7 +17,8 @@ Make it the bitter channel babushka, anxious robot or cybercop!
 
 - Connects to IRC with optional TLS and NickServ identification.
 - Uses any Ollama chat model exposed through the configured API endpoint.
-- Includes recent channel history in LLM requests for conversational context.
+- Uses a trimmed recent-history window while preserving user context.
+- Limits prior bot replies and retries near-duplicate generated responses once.
 - Stores up to 500 messages per network and channel in SQLite.
 - Summarizes recent channel activity in three compact IRC lines.
 - Searches the web through the Tavily Search API.
@@ -31,7 +32,7 @@ Commands can be entered directly in the channel and are case-insensitive.
 
 | Command | Description |
 | --- | --- |
-| `!model` | Shows the configured Ollama model, temperature, `top_p`, and context size. |
+| `!model` | Shows the configured Ollama model, temperature, `top_p`, context size, and thinking mode. |
 | `!uptime` | Shows the bot process uptime and IRC network name. |
 | `!status` | Shows the network, uptime, and model. |
 | `!summary` | Summarizes the last 50 stored channel messages. |
@@ -68,6 +69,19 @@ positive or negative numbers. Expressions are parsed with Python's AST rather
 than evaluated as arbitrary code.
 
 The date and time tool uses the local timezone of the machine running the bot.
+
+### Conversation history
+
+ComradeBot stores up to 500 messages per network and channel, but normal LLM
+requests use only a recent window of up to 12 messages. User messages are kept
+intact. At most two previous bot replies are included, and those replies are
+shortened when necessary.
+
+The current addressed message is sent as the user prompt rather than repeated
+inside the history transcript. After generation, the reply is compared with
+the bot's eight most recent replies using dependency-free text similarity. A
+near-duplicate is retried once with an instruction to use substantially
+different wording and avoid repeated jokes or catchphrases.
 
 ## Requirements
 
@@ -111,6 +125,7 @@ OLLAMA_NUM_CTX=2048
 OLLAMA_NUM_PREDICT=160
 OLLAMA_NUM_GPU=-1
 OLLAMA_KEEP_ALIVE=30m
+OLLAMA_THINK=false
 OLLAMA_TEMPERATURE=0.7
 OLLAMA_TOP_P=0.9
 
@@ -146,6 +161,7 @@ TAVILY_API_KEY=
 | `OLLAMA_NUM_PREDICT` | No | `160` | Maximum tokens for normal replies. |
 | `OLLAMA_NUM_GPU` | No | `-1` | Ollama GPU layer setting. |
 | `OLLAMA_KEEP_ALIVE` | No | `30m` | How long Ollama keeps the model loaded. |
+| `OLLAMA_THINK` | No | `false` | Ollama thinking mode: `true`, `false`, `low`, `medium`, or `high`. Disabled by default so reasoning tokens do not consume the short IRC reply budget. |
 | `OLLAMA_TEMPERATURE` | No | `0.7` | Temperature for normal replies. |
 | `OLLAMA_TOP_P` | No | `0.9` | Top-p value for normal replies. |
 | `OLLAMA_SUMMARY_NUM_PREDICT` | No | `120` | Maximum tokens for summaries. |
@@ -255,7 +271,10 @@ according to the host's journald configuration.
 ### Ollama data flow
 
 When someone addresses the bot, ComradeBot sends the system prompt, their
-prompt, and up to 30 recent messages from that channel to `OLLAMA_URL`.
+prompt, and a trimmed window of up to 12 recent messages from that channel to
+`OLLAMA_URL`. The window keeps user context while limiting prior bot replies
+to two shortened entries. A generated reply that closely matches one of the
+bot's eight most recent replies is retried once with a rephrasing instruction.
 `!summary` sends up to 200 stored channel messages. The default Ollama URL is
 local, but operators can configure a remote endpoint. A remote Ollama server
 receives this channel content in plain application payloads and may apply its
